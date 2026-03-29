@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_URL="https://github.com/lordidiot/dotfiles.git"
+GIT_DIR="$HOME/.dotfiles"
+WORK_TREE="$HOME"
+BACKUP_DIR="$HOME/.dotfiles-backup/$(date +%Y%m%d-%H%M%S)"
+
+log() {
+  printf '%s\n' "$*"
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+detect_shell_rc() {
+  if [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "${SHELL:-}")" = "zsh" ]; then
+    printf '%s\n' "$HOME/.zshrc"
+    return
+  fi
+  if [ -n "${BASH_VERSION:-}" ] || [ "$(basename "${SHELL:-}")" = "bash" ]; then
+    if [ -f "$HOME/.bashrc" ]; then
+      printf '%s\n' "$HOME/.bashrc"
+    else
+      printf '%s\n' "$HOME/.bash_profile"
+    fi
+    return
+  fi
+  printf '%s\n' "$HOME/.profile"
+}
+
+cfg() {
+  /usr/bin/git --git-dir="$GIT_DIR" --work-tree="$WORK_TREE" "$@"
+}
+
+ensure_git() {
+  if ! have_cmd git; then
+    log "git is required but not installed."
+    exit 1
+  fi
+}
+
+clone_bare_if_needed() {
+  if [ -d "$GIT_DIR" ]; then
+    if /usr/bin/git --git-dir="$GIT_DIR" rev-parse --is-bare-repository >/dev/null 2>&1; then
+      log "Using existing bare repo at $GIT_DIR"
+      return
+    fi
+    log "Error: $GIT_DIR exists but is not a bare git repository."
+    exit 1
+  fi
+
+  log "Cloning bare repository into $GIT_DIR"
+  git clone --bare "$REPO_URL" "$GIT_DIR"
+}
+
+backup_conflicts_and_checkout() {
+  mkdir -p "$BACKUP_DIR"
+
+  set +e
+  checkout_output="$(cfg checkout 2>&1)"
+  checkout_status=$?
+  set -e
+
+  if [ $checkout_status -eq 0 ]; then
+    log "Checked out dotfiles successfully."
+    return
+  fi
+
+  log "Checkout reported conflicts. Backing up conflicting files to:"
+  log "  $BACKUP_DIR"
+
+  printf '%s\n' "$checkout_output" \
+    | sed '1,/would be overwritten by checkout:/d' \
+    | sed '/^$/d' \
+    | while IFS= read -r path; do
+        case "$path" in
+          *":")
+            continue
+            ;;
+        esac
+        src="$HOME/$path"
+        dst="$BACKUP_DIR/$path"
+        if [ -e "$src" ] || [ -L "$src" ]; then
+          mkdir -p "$(dirname "$dst")"
+          mv "$src" "$dst"
+          log "Moved $src -> $dst"
+        fi
+      done
+
+  cfg checkout
+}
+
+configure_repo() {
+  cfg config --local status.showUntrackedFiles no
+}
+
+install_shell_helper() {
+  rc_file="$(detect_shell_rc)"
+  marker_start="# >>> dotfiles config alias >>>"
+  marker_end="# <<< dotfiles config alias <<<"
+
+  snippet=$(cat <<'EOF'
+# >>> dotfiles config alias >>>
+config() {
+  /usr/bin/git --git-dir="$HOME/.dotfiles" --work-tree="$HOME" "$@"
+}
+# <<< dotfiles config alias <<<
+EOF
+)
+
+  if [ -f "$rc_file" ] && grep -Fq "$marker_start" "$rc_file"; then
+    log "Shell helper already present in $rc_file"
+    return
+  fi
+
+  touch "$rc_file"
+  printf '\n%s\n' "$snippet" >> "$rc_file"
+  log "Added config() helper to $rc_file"
+  log "Open a new shell or run:"
+  log "  source $rc_file"
+}
+
+main() {
+  ensure_git
+  clone_bare_if_needed
+  backup_conflicts_and_checkout
+  configure_repo
+  install_shell_helper
+
+  log
+  log "Done."
+  log "After reloading your shell, use:"
+  log "  config status"
+  log "  config add ~/.zshrc"
+  log "  config commit -m 'Update dotfiles'"
+}
+
+main "$@"
